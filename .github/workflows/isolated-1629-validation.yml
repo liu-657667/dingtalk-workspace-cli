@@ -1,0 +1,212 @@
+name: DWS 1629 isolated validation
+'on':
+  push:
+    branches:
+    - ci/1629-isolated-validation
+permissions:
+  contents: read
+env:
+  DO_NOT_TRACK: '1'
+  DWS_PACKAGE_VERSION: 0.0.0-test
+concurrency:
+  group: dws-1629-isolated-validation
+  cancel-in-progress: false
+jobs:
+  test-darwin:
+    name: Test (macOS auth/keychain)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v4
+      with:
+        ref: 232960c37bc4216de2a9f63089d2e7d6b12b45a8
+        persist-credentials: false
+        fetch-depth: 0
+    - name: Verify exact candidate identity
+      shell: bash
+      run: |
+        test "$(git rev-parse HEAD)" = "232960c37bc4216de2a9f63089d2e7d6b12b45a8"
+        test "$(git rev-parse HEAD^{tree})" = "382c017cbcedab1579f472de1c4d990ee2036cd0"
+        test -z "$(git status --porcelain)"
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+        cache: false
+    - name: Test macOS auth and Keychain packages with Race Detection
+      run: go test -v -race -count=1 -timeout=6m ./internal/keychain ./internal/auth
+    - name: Test macOS auth migration, Keychain diagnostics, and upgrade self-heal with Race Detection
+      run: go test -v -race -count=1 -timeout=5m ./internal/app -run '^(TestValidateNewBinary_RecoversFromUnsignedDarwin|Test(CrossPlatformCoverage)?Auth(MigrateKeychain|StatusDiagnosticReportsCiphertextKeyMismatch))'
+    if: github.repository == 'liu-657667/dingtalk-workspace-cli' && github.ref == 'refs/heads/ci/1629-isolated-validation'
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v4
+      with:
+        ref: 232960c37bc4216de2a9f63089d2e7d6b12b45a8
+        persist-credentials: false
+        fetch-depth: 0
+    - name: Verify exact candidate identity
+      shell: bash
+      run: |
+        test "$(git rev-parse HEAD)" = "232960c37bc4216de2a9f63089d2e7d6b12b45a8"
+        test "$(git rev-parse HEAD^{tree})" = "382c017cbcedab1579f472de1c4d990ee2036cd0"
+        test -z "$(git status --porcelain)"
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+        cache: false
+    - name: Enable MinGW for SafeChat CGO
+      shell: pwsh
+      run: |
+        "C:\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        & "C:\mingw64\bin\gcc.exe" --version
+    - name: Build Windows CLI
+      run: go build -o dws.exe ./cmd
+    - name: Test Windows auth and DPAPI packages
+      run: go test -v -count=1 -timeout=10m ./internal/keychain ./internal/auth
+    - name: Test Windows auth migration and portable auth diagnostics
+      run: go test -v -count=1 -timeout=5m ./internal/app -run '^Test(CrossPlatformCoverage)?Auth(MigrateKeychain|StatusDiagnosticReportsCiphertextKeyMismatch|ExportRejectsWindowsDPAPIBackend|ImportRejectsWindowsDPAPIBackend)'
+    if: github.repository == 'liu-657667/dingtalk-workspace-cli' && github.ref == 'refs/heads/ci/1629-isolated-validation'
+  test-race:
+    name: 'Test (race: ${{ matrix.shard }})'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+        - app-lane-1
+        - app-lane-2
+        - app-lane-3
+        - generators
+        - helpers
+        - cli
+        - smoke
+        - remaining
+      max-parallel: 2
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v4
+      with:
+        ref: 232960c37bc4216de2a9f63089d2e7d6b12b45a8
+        persist-credentials: false
+        fetch-depth: 0
+    - name: Verify exact candidate identity
+      shell: bash
+      run: |
+        test "$(git rev-parse HEAD)" = "232960c37bc4216de2a9f63089d2e7d6b12b45a8"
+        test "$(git rev-parse HEAD^{tree})" = "382c017cbcedab1579f472de1c4d990ee2036cd0"
+        test -z "$(git status --porcelain)"
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+        cache: false
+    - name: Build
+      if: ${{ matrix.shard == 'remaining' }}
+      run: make build
+    - name: Test shard with Race Detection
+      shell: bash
+      env:
+        DWS_PACKAGE_VERSION: 0.0.0-test
+        TEST_SHARD: ${{ matrix.shard }}
+      run: |
+        set -euo pipefail
+        # Every app lane tests the same single internal/app package, so the
+        # package query uses the base shard name and the lane only selects
+        # which process-isolated test partitions run.
+        package_shard="$TEST_SHARD"
+        case "$TEST_SHARD" in
+          app-lane-*) package_shard=app ;;
+        esac
+        package_output="$(./scripts/ci/test-packages.sh list "$package_shard")"
+        test -n "$package_output"
+        mapfile -t packages <<< "$package_output"
+        test "${#packages[@]}" -gt 0
+        case "$TEST_SHARD" in
+          app-lane-*)
+            # Each lane invokes several logical partitions sequentially, and
+            # every partition remains a fresh Go test process so framework
+            # registries are released between partitions. The helper verifies
+            # that all lanes cover every logical partition exactly once.
+            test "${#packages[@]}" -eq 1
+            ./scripts/ci/run-app-race-tests.sh run-lane "${packages[0]}" "${TEST_SHARD#app-}"
+            exit 0
+            ;;
+        esac
+        # cli/smoke 的 Schema 装配和 helpers 的命令矩阵、图片压缩在
+        # -race 下耗时较长；helpers 在 run 38711691277 耗尽了 12m。
+        # 给这些分片 18m，保留完整测试集合和 race 检测。
+        timeout_budget=12m
+        if [ "$TEST_SHARD" = "cli" ] ||
+           [ "$TEST_SHARD" = "smoke" ] ||
+           [ "$TEST_SHARD" = "helpers" ]; then
+          timeout_budget=18m
+        fi
+        go test -v -race -count=1 -timeout="$timeout_budget" "${packages[@]}"
+    if: github.repository == 'liu-657667/dingtalk-workspace-cli' && github.ref == 'refs/heads/ci/1629-isolated-validation'
+  coverage-current-full:
+    name: 'Coverage (current: ${{ matrix.shard }})'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+        - app
+        - cli
+        - generators
+        - helpers
+        - remaining
+      max-parallel: 2
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v4
+      with:
+        ref: 232960c37bc4216de2a9f63089d2e7d6b12b45a8
+        persist-credentials: false
+        fetch-depth: 0
+    - name: Verify exact candidate identity
+      shell: bash
+      run: |
+        test "$(git rev-parse HEAD)" = "232960c37bc4216de2a9f63089d2e7d6b12b45a8"
+        test "$(git rev-parse HEAD^{tree})" = "382c017cbcedab1579f472de1c4d990ee2036cd0"
+        test -z "$(git status --porcelain)"
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+        cache: false
+    - name: Install archive tooling
+      run: |
+        if command -v zip >/dev/null && command -v unzip >/dev/null; then
+          echo "zip and unzip are already available"
+        else
+          sudo apt-get update
+          sudo apt-get install -y zip unzip
+        fi
+    - name: Build
+      run: make build
+    - name: Run current shard tests with coverage
+      shell: bash
+      env:
+        DWS_PACKAGE_VERSION: 0.0.0-test
+        COVERAGE_SHARD: ${{ matrix.shard }}
+      run: |
+        set -euo pipefail
+        ./scripts/ci/run-coverage-shard.sh run \
+          "$COVERAGE_SHARD" "coverage-shard-$COVERAGE_SHARD.txt"
+        go tool cover -func="coverage-shard-$COVERAGE_SHARD.txt" | tail -n 1
+    - name: Upload current shard coverage profile
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-current-shard-${{ matrix.shard }}
+        path: coverage-shard-${{ matrix.shard }}.txt
+        retention-days: 1
+    if: github.repository == 'liu-657667/dingtalk-workspace-cli' && github.ref == 'refs/heads/ci/1629-isolated-validation'
